@@ -1,0 +1,469 @@
+太好了！下面给你一套**零成本/本地优先**的“大数据爬取”实操路线，从零到能稳定跑。你只要照着做，就能先把文本与图片抓下来，后续再扩展到音视频。
+
+---
+
+# 0. 先定边界（很重要）
+
+* **合法合规**：优先抓取开放许可/允许抓取的网站；遵守 robots.txt、站点条款；标注来源与许可字段。
+* **聚焦主题**：先做“民族记忆/非遗”相关的**站点白名单**（博物馆、地方志网站、政府非遗名录、学术机构、公益项目、新闻专题页等），这样可少踩反爬、也更干净。
+* **先易后难**：优先 RSS、网站地图（sitemap）、栏目分页；复杂 JS 站点再用无头浏览器。
+
+---
+
+# 1. 本地环境（Windows/Mac/Linux 都行）
+
+```bash
+# 建议 Python 3.10+
+python -m venv venv
+source venv/bin/activate       # Windows: venv\Scripts\activate
+pip install --upgrade pip
+
+# 基础库：高性价比、能跑大多数网页
+pip install scrapy trafilatura readability-lxml langdetect tldextract \
+            beautifulsoup4 lxml fake-useragent brotli orjson
+
+# 图片与视频（按需）
+pip install pillow
+pip install yt-dlp
+```
+
+---
+
+# 2. 项目结构（开箱即用）
+
+```
+heritage_crawl/
+├─ seeds/                # 种子URL、RSS、sitemap清单
+│  ├─ allow_domains.txt
+│  ├─ seeds.txt
+│  └─ rss.txt
+├─ data/
+│  ├─ raw/               # 原始HTML、二进制
+│  ├─ text/              # 提取后的纯文本JSONL
+│  └─ media/             # 图片/音视频
+├─ db/
+│  └─ crawl.sqlite       # 去重/任务队列/元数据
+├─ logs/
+├─ scrapy.cfg
+└─ crawler/
+   ├─ __init__.py
+   ├─ items.py
+   ├─ middlewares.py
+   ├─ pipelines.py
+   ├─ settings.py
+   └─ spiders/
+      ├─ generic_seed_spider.py
+      └─ rss_spider.py
+```
+
+---
+
+# 3. 用 Scrapy 打底 + trafilatura 提取正文
+
+下面是**最小可用**的 Scrapy 配置与爬虫，支持：
+
+* 读 `seeds.txt` 扫站内链接；
+* 严格**白名单域名**；
+* **速率限制**（本地跑不被封的关键）；
+* **去重**（URL 规范化 + 内容哈希）；
+* **文本抽取**（trafilatura）；
+* **落地**：`data/text/*.jsonl` + `db/crawl.sqlite`。
+
+### `crawler/settings.py`（重点片段）
+
+```python
+BOT_NAME = "crawler"
+SPIDER_MODULES = ["crawler.spiders"]
+NEWSPIDER_MODULE = "crawler.spiders"
+
+ROBOTSTXT_OBEY = True
+DOWNLOAD_DELAY = 1.0           # 基础延迟
+RANDOMIZE_DOWNLOAD_DELAY = True
+CONCURRENT_REQUESTS = 8        # 不要太大，本地+省钱
+RETRY_ENABLED = True
+RETRY_TIMES = 2
+HTTPERROR_ALLOWED_CODES = [403, 404, 429, 500, 502, 503]
+
+DEFAULT_REQUEST_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+
+DOWNLOADER_MIDDLEWARES = {
+    "crawler.middlewares.RandomUserAgent": 400,
+}
+
+ITEM_PIPELINES = {
+    "crawler.pipelines.DedupeAndStorePipeline": 300,
+}
+
+# 文件落地
+FILES_STORE = "data/raw"
+IMAGES_STORE = "data/media"
+
+LOG_LEVEL = "INFO"
+FEED_EXPORT_ENCODING = "utf-8"
+```
+
+### `crawler/middlewares.py`（随机 UA）
+
+```python
+from fake_useragent import UserAgent
+
+class RandomUserAgent:
+    def __init__(self):
+        self.ua = UserAgent()
+
+    def process_request(self, request, spider):
+        request.headers["User-Agent"] = self.ua.random
+        return None
+```
+
+### `crawler/items.py`
+
+```python
+import scrapy
+
+class PageItem(scrapy.Item):
+    url = scrapy.Field()
+    domain = scrapy.Field()
+    fetched_at = scrapy.Field()
+    status = scrapy.Field()
+    content_type = scrapy.Field()
+    title = scrapy.Field()
+    lang = scrapy.Field()
+    text = scrapy.Field()
+    html_path = scrapy.Field()
+    checksum = scrapy.Field()
+    outlinks = scrapy.Field()
+    license = scrapy.Field()
+    robots = scrapy.Field()
+```
+
+### `crawler/pipelines.py`（去重+文本抽取+JSONL）
+
+```python
+import os, sqlite3, hashlib, orjson, time, tldextract
+from pathlib import Path
+from langdetect import detect
+from trafilatura import extract
+from scrapy.exceptions import DropItem
+
+DB_PATH = "db/crawl.sqlite"
+TEXT_DIR = Path("data/text")
+RAW_DIR = Path("data/raw")
+
+class DedupeAndStorePipeline:
+    def open_spider(self, spider):
+        Path("db").mkdir(exist_ok=True, parents=True)
+        TEXT_DIR.mkdir(exist_ok=True, parents=True)
+        RAW_DIR.mkdir(exist_ok=True, parents=True)
+        self.conn = sqlite3.connect(DB_PATH)
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS seen(
+            url TEXT PRIMARY KEY, checksum TEXT, fetched_at REAL)""")
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS text_index(
+            checksum TEXT PRIMARY KEY, url TEXT, title TEXT, lang TEXT)""")
+        self.conn.commit()
+
+    def close_spider(self, spider):
+        self.conn.close()
+
+    def _seen(self, url):
+        cur = self.conn.execute("SELECT 1 FROM seen WHERE url=?", (url,))
+        return cur.fetchone() is not None
+
+    def _mark_seen(self, url, checksum):
+        self.conn.execute("INSERT OR REPLACE INTO seen(url, checksum, fetched_at) VALUES (?,?,?)",
+                          (url, checksum, time.time()))
+        self.conn.commit()
+
+    def process_item(self, item, spider):
+        if self._seen(item["url"]):
+            raise DropItem("dup-url")
+
+        html_path = item.get("html_path")
+        if not html_path or not os.path.exists(html_path):
+            raise DropItem("no-html")
+
+        with open(html_path, "rb") as f:
+            raw = f.read()
+
+        checksum = hashlib.sha1(raw).hexdigest()
+        item["checksum"] = checksum
+
+        # 全站内容去重
+        cur = self.conn.execute("SELECT 1 FROM text_index WHERE checksum=?", (checksum,))
+        if cur.fetchone():
+            self._mark_seen(item["url"], checksum)
+            raise DropItem("dup-content")
+
+        # 正文抽取
+        text = extract(raw.decode("utf-8", errors="ignore"),
+                       include_links=False, include_images=False) or ""
+        if len(text.strip()) < 200:  # 太短跳过
+            self._mark_seen(item["url"], checksum)
+            raise DropItem("short")
+
+        item["text"] = text
+        try:
+            item["lang"] = detect(text)
+        except Exception:
+            item["lang"] = "und"
+
+        # 写 JSONL（一条一行，后续RAG最方便）
+        out = {
+            "url": item["url"],
+            "domain": item.get("domain"),
+            "fetched_at": item.get("fetched_at"),
+            "status": item.get("status"),
+            "content_type": item.get("content_type"),
+            "title": item.get("title"),
+            "lang": item.get("lang"),
+            "text": item.get("text"),
+            "checksum": checksum,
+            "license": item.get("license"),
+            "robots": item.get("robots"),
+            "outlinks": item.get("outlinks", []),
+        }
+        with open(TEXT_DIR / f"{tldextract.extract(item['url']).domain}.jsonl", "ab") as fw:
+            fw.write(orjson.dumps(out) + b"\n")
+
+        self.conn.execute("INSERT OR REPLACE INTO text_index(checksum, url, title, lang) VALUES (?,?,?,?)",
+                          (checksum, item["url"], item.get("title"), item.get("lang")))
+        self.conn.commit()
+
+        self._mark_seen(item["url"], checksum)
+        return item
+```
+
+### `crawler/spiders/generic_seed_spider.py`（通用种子爬虫）
+
+```python
+import os, time, tldextract
+import scrapy
+from pathlib import Path
+from ..items import PageItem
+
+class GenericSeedSpider(scrapy.Spider):
+    name = "seed"
+    custom_settings = {
+        "DOWNLOAD_TIMEOUT": 20,
+    }
+
+    def start_requests(self):
+        allow_domains = Path("seeds/allow_domains.txt").read_text(encoding="utf-8").splitlines()
+        self.allowed = set([d.strip().lower() for d in allow_domains if d.strip()])
+        seeds = Path("seeds/seeds.txt").read_text(encoding="utf-8").splitlines()
+        for u in seeds:
+            if not u.strip(): continue
+            yield scrapy.Request(u.strip(), callback=self.parse, dont_filter=True)
+
+    def allowed_domain(self, url):
+        ext = tldextract.extract(url)
+        dom = f"{ext.domain}.{ext.suffix}".lower()
+        return (dom in self.allowed) or any(dom.endswith("." + d) for d in self.allowed)
+
+    def parse(self, response):
+        url = response.url
+        if not self.allowed_domain(url):
+            return
+
+        # 保存原始HTML
+        ts = str(int(time.time()))
+        ext = tldextract.extract(url)
+        dom = f"{ext.domain}.{ext.suffix}"
+        raw_dir = Path("data/raw") / dom
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        html_path = raw_dir / f"{ts}.html"
+        html_path.write_bytes(response.body)
+
+        item = PageItem()
+        item["url"] = url
+        item["domain"] = dom
+        item["fetched_at"] = time.time()
+        item["status"] = response.status
+        item["content_type"] = response.headers.get("Content-Type", b"").decode("utf-8", "ignore")
+        item["title"] = response.css("title::text").get() or ""
+        item["html_path"] = str(html_path)
+        item["robots"] = "allowed" if getattr(response, "flags", None) else "unknown"
+        item["outlinks"] = []
+
+        # 继续抓站内链接（宽度可控）
+        for a in response.css("a::attr(href)").getall():
+            a = response.urljoin(a)
+            if self.allowed_domain(a):
+                item["outlinks"].append(a)
+                yield scrapy.Request(a, callback=self.parse)
+
+        yield item
+```
+
+### `seeds/allow_domains.txt`（例）
+
+```
+ihchina.cn
+www.ihchina.cn
+www.gov.cn
+www.ncha.gov.cn
+www.mct.gov.cn
+```
+
+### `seeds/seeds.txt`（例）
+
+```
+https://www.ihchina.cn/
+https://www.mct.gov.cn/whzx/whyw/
+```
+
+**运行：**
+
+```bash
+scrapy crawl seed
+```
+
+完成后，清洗过的**正文数据**会在 `data/text/*.jsonl`，可直接进你的 RAG 里做 embedding。
+
+---
+
+# 4. RSS / Sitemap 更省力（可选但强烈推荐）
+
+比起全站爬，RSS/Sitemap 更稳更快。
+
+### 简单 RSS 爬虫（`crawler/spiders/rss_spider.py`）
+
+```python
+import scrapy, time, feedparser
+from pathlib import Path
+from ..items import PageItem
+
+class RSSSpider(scrapy.Spider):
+    name = "rss"
+    def start_requests(self):
+        feeds = Path("seeds/rss.txt").read_text(encoding="utf-8").splitlines()
+        for f in feeds:
+            if not f.strip(): continue
+            d = feedparser.parse(f.strip())
+            for e in d.entries:
+                url = e.link
+                yield scrapy.Request(url, callback=self.parse_article)
+
+    def parse_article(self, response):
+        item = PageItem()
+        item["url"] = response.url
+        item["fetched_at"] = time.time()
+        item["status"] = response.status
+        item["content_type"] = response.headers.get("Content-Type", b"").decode("utf-8", "ignore")
+        item["title"] = response.css("title::text").get() or ""
+        # 复用通用管线：落盘原始HTML
+        p = Path("data/raw/rss"); p.mkdir(parents=True, exist_ok=True)
+        html_path = p / f"{int(time.time()*1000)}.html"
+        html_path.write_bytes(response.body)
+        item["html_path"] = str(html_path)
+        yield item
+```
+
+---
+
+# 5. 图片/音视频抓取（按需启用）
+
+* **图片**：Scrapy 自带 `ImagesPipeline` 可扩展；也可在正文提取时解析 `<img>` 下载到 `data/media/`，文件名用 **URL+SHA1** 去重。
+* **视频/音频（公开资源）**：用 `yt-dlp`，示例：
+
+  ```bash
+  yt-dlp -o "data/media/%(uploader)s/%(title)s.%(ext)s" URL
+  ```
+
+  记得**遵守站点版权/许可**；把**来源URL、作者、许可**写入你存储的 `metadata.jsonl`。
+
+---
+
+# 6. 元数据与去重规范（建议直接用）
+
+为后续 RAG 与版权合规，统一 schema（JSONL 每行一条）：
+
+```json
+{
+  "url": "...",
+  "domain": "example.com",
+  "fetched_at": 1696406400.0,
+  "status": 200,
+  "content_type": "text/html; charset=utf-8",
+  "title": "文章标题",
+  "lang": "zh",
+  "text": "……正文……",
+  "checksum": "sha1-of-raw",
+  "license": "未知/CC-BY/网站声明…",
+  "robots": "allowed",
+  "outlinks": ["https://…", "…"]
+}
+```
+
+* **URL 去重**：标准化后写到 `db/seen(url)`。
+* **内容去重**：对**原始HTML**做 `SHA1`，命中即跳过（已在上面管线实现）。
+* **存储**：文本用 **JSONL** 最省事；媒体文件按 **域名分目录**，文件名加 `sha1`。
+
+---
+
+# 7. 低成本稳跑原则
+
+* **限速**：`DOWNLOAD_DELAY=1~2s` + `CONCURRENT_REQUESTS=8` 左右。
+* **自恢复**：Scrapy 自带断点续爬（`JOBDIR=jobs/seed`）：
+
+  ```bash
+  scrapy crawl seed -s JOBDIR=jobs/seed
+  ```
+* **日志轮转**：每天一个文件（用 shell 或把 `LOG_FILE` 写日期）。
+* **分批跑**：先 1–2 个域名验证→扩到 10 个→再扩站点列表。
+* **存储预算**：文本超省；图片/视频占空间，按主题先抓封面/缩略图，视频先存 **URL+元数据**，需要时再拉原文件。
+
+---
+
+# 8. 何时用无头浏览器（Playwright）
+
+只有当页面**强依赖 JS 才能出正文**时再上。
+
+```bash
+pip install scrapy-playwright
+```
+
+`settings.py` 增：
+
+```python
+DOWNLOADER_MIDDLEWARES.update({
+  "scrapy_playwright.middleware.ScrapyPlaywrightDownloaderMiddleware": 543
+})
+PLAYWRIGHT_BROWSER_TYPE = "chromium"
+PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = 20000
+```
+
+爬虫里：
+
+```python
+yield scrapy.Request(url, meta={"playwright": True}, callback=self.parse)
+```
+
+成本：更慢、更吃内存，所以**少用**。
+
+---
+
+# 9. 任务清单（建议你今天就做）
+
+1. 装好环境，`heritage_crawl` 目录就按上面建。
+2. 往 `allow_domains.txt` 放 5–10 个最确定的网站；`seeds.txt` 放它们的首页/栏目页。
+3. `scrapy crawl seed -s JOBDIR=jobs/seed` 跑起来。
+4. 看 `data/text/*.jsonl` 是否有干净正文；不理想就调 `trafilatura.extract` 参数或换站点。
+5. 每晚丢 1–2 个新站点进白名单，逐步扩容。
+
+---
+
+# 10. 后续扩展（等你第一波跑稳再加）
+
+* **语言识别/分段**：把长文分段，存 `segments[]`（方便 embedding）。
+* **版权/许可字段自动抓取**：解析页脚“版权/许可/转载声明”。
+* **OCR/ASR**：对图片做 OCR（pytesseract）；对音视频用 `whisper` 本地识别（慢但免费）。
+* **反爬优化**：请求重试指数退避、代理（本地不建议先买）、夜间跑。
+* **可视化监控**：写一个简易 `status.html`，展示抓取量、失败率、域名 TopN。
+
+---
+
+如果你愿意，我可以把上述骨架**打包成完整可运行项目**（包含所有文件），你直接下载然后把 `allow_domains.txt` 和 `seeds.txt` 填上就能跑。要不要我现在就生成这份 starter 包给你？

@@ -1,0 +1,11 @@
+scrapy==2.11.1
+trafilatura==1.7.0
+readability-lxml==0.8.1
+langdetect==1.0.9
+tldextract==5.1.2
+beautifulsoup4==4.12.3
+lxml==5.2.2
+orjson==3.10.7
+feedparser==6.0.11
+pillow==10.4.0
+yt-dlp
