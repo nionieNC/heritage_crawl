@@ -15,7 +15,6 @@ class PageItem(scrapy.Item):
     # 结构化
     meta = scrapy.Field()         # dict：项目基本信息
     bearers = scrapy.Field()      # list[dict]：代表性传承人
-    text_lines = scrapy.Field()   # list[str]：正文分段（可选，用于避免 \n 被替换）
 
     # 抓取/解析附加信息（你的 pipeline/输出里已出现过）
     checksum = scrapy.Field()     # 去重/签名
@@ -24,3 +23,8 @@ class PageItem(scrapy.Item):
     outlinks = scrapy.Field()     # list[str]：外链（若收集）
     content_type = scrapy.Field() # Content-Type（若记录）
     lang = scrapy.Field()         # 语言（若记录）
+
+    text_augmented = scrapy.Field()   # True/False
+    augmented_at = scrapy.Field()     # ISO 时间戳
+    enrich_mode = scrapy.Field()      # none/append/replace
+    enrich_format = scrapy.Field()    # readable/json

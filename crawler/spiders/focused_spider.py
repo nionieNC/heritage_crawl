@@ -27,25 +27,113 @@ class FocusedSpider(scrapy.Spider):
     custom_settings = {
         "ROBOTSTXT_OBEY": False,
         "LOG_LEVEL": "INFO",
-        "ITEM_PIPELINES": {
-            "crawler.pipelines.DedupeAndStorePipeline": 300
-        },
+        "ITEM_PIPELINES": {"crawler.pipelines.DedupeAndStorePipeline": 300},
         "CLOSESPIDER_ITEMCOUNT": 1,
         "REQUEST_FINGERPRINTER_IMPLEMENTATION": "2.7",
         "FEED_EXPORT_ENCODING": "utf-8",
     }
 
-    def __init__(self, start=13774, end=13774, *args, **kwargs):
+    def __init__(self, start=13774, end=13774,
+                 enrich_mode="none",          # NEW: none|append|replace
+                 enrich_format="readable",    # NEW: readable|json
+                 add_json_summary="0",        # NEW: "1"/"0"
+                 *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.start_id = int(start)
         self.end_id = int(end)
-        # 预编译：用于单元格内多对“键：值”切分
+
+        # NEW: 参数归一化
+        self.enrich_mode = (enrich_mode or "none").lower()     # none/append/replace
+        self.enrich_format = (enrich_format or "readable").lower()
+        self.add_json_summary = str(add_json_summary).strip() in ("1","true","yes","on")
+
+        # 常量
+        self.META_ORDER = ["项目序号", "项目编号", "公布时间", "类别", "所属地区", "类型", "申报地区或单位", "保护单位"]
+        self.BEARER_ORDER = ["编号", "姓名", "性别", "出生日期", "民族", "类别", "项目编号", "项目名称",
+                             "申报地区或单位"]
+        self.RULER = "\n\n——\n\n"
+
+        # 预编译……
         label_alt = "|".join(map(re.escape, META_KEYS))
-        # 匹配：<键>(：|:)?<若干空白><值>，并允许一个 cell 内出现多对
         self.meta_kv_regex = re.compile(rf"({label_alt})\s*[：:]\s*")
 
         bearer_label_alt = "|".join(map(re.escape, BEARER_KEYS))
         self.bearer_prefix_regex = re.compile(rf"^({bearer_label_alt})\s*[：:\u3000 ]*")
+
+        # ---------- NEW: 可读文本块 ----------
+    def _block_meta_readable(self, meta: dict) -> str:
+            if not isinstance(meta, dict) or not meta:
+                return ""
+            order = ["项目序号", "项目编号", "公布时间", "公布批次", "批次",
+                     "类别", "所属地区", "类型", "申报地区或单位", "保护单位"]
+            lines = []
+            for k in order:
+                v = meta.get(k)
+                if v and str(v).strip():
+                    lines.append(f"{k}：{str(v).strip()}")
+            # 其余键追加
+            for k, v in meta.items():
+                if k not in order and v and str(v).strip():
+                    lines.append(f"{k}：{str(v).strip()}")
+            return "【项目基本信息】\n" + "\n".join(lines) if lines else ""
+
+    def _block_bearers_readable(self, bearers: list) -> str:
+            if not isinstance(bearers, list) or not bearers:
+                return ""
+            order = ["编号", "姓名", "性别", "出生日期", "民族", "类别", "项目编号", "项目名称", "申报地区或单位"]
+            lines = []
+            for b in bearers:
+                if not isinstance(b, dict):
+                    continue
+                head = []
+                name = (b.get("姓名") or "").strip()
+                gender = (b.get("性别") or "").strip()
+                eth = (b.get("民族") or "").strip()
+                dob = (b.get("出生日期") or "").strip()
+                if name:
+                    s = f"姓名：{name}"
+                    attrs = []
+                    if gender: attrs.append(f"性别：{gender}")
+                    if eth:    attrs.append(f"民族：{eth}")
+                    if dob:    attrs.append(f"出生日期：{dob}")
+                    if attrs:
+                        s += "（" + "，".join(attrs) + "）"
+                    head.append(s)
+                for k in order:
+                    if k in ("姓名", "性别", "民族", "出生日期"):
+                        continue
+                    v = b.get(k)
+                    if v and str(v).strip():
+                        head.append(f"{k}：{str(v).strip()}")
+                # 额外键
+                for k, v in b.items():
+                    if k in order:
+                        continue
+                    if v and str(v).strip():
+                        head.append(f"{k}：{str(v).strip()}")
+                if head:
+                    lines.append("- " + "；".join(head))
+            return "【代表性传承人】\n" + "\n".join(lines) if lines else ""
+
+        # ---------- NEW: JSON 文本块 ----------
+    def _block_meta_json(self, meta: dict) -> str:
+            if not isinstance(meta, dict) or not meta:
+                return ""
+            import json
+            return "【项目基本信息-JSON】\n" + json.dumps(meta, ensure_ascii=False)
+
+    def _block_bearers_json(self, bearers: list) -> str:
+            if not isinstance(bearers, list) or not bearers:
+                return ""
+            import json
+            return "【代表性传承人-JSON】\n" + json.dumps(bearers, ensure_ascii=False)
+
+    def _block_summary_json(self, meta: dict, bearers: list) -> str:
+            import json
+            payload = {}
+            if isinstance(meta, dict) and meta: payload["meta"] = meta
+            if isinstance(bearers, list) and bearers: payload["bearers"] = bearers
+            return "【JSON摘要】\n" + json.dumps(payload, ensure_ascii=False) if payload else ""
 
     # ---------------- 工具函数 ----------------
     def _norm(self, s: str | None) -> str:
@@ -287,9 +375,36 @@ class FocusedSpider(scrapy.Spider):
         # 2) 观测：日志里直观看到是否抓到了正文
         self.logger.info(f"[BODY] got {len(body_paras)} paras; first={body_paras[0][:40] if body_paras else ''}")
 
-        # 纯文本 & 段落数组（供下游自由选择）
-        meta_lines = [f"{k}：{v}" for k, v in meta.items()]
-        text_clean = "\n".join(meta_lines + ([""] if meta_lines and body_paras else []) + body_paras).strip()
+        # ---------- NEW: 合成最终 text ----------
+        RULER = "\n\n——\n\n"  # 分隔线
+        # 基线文本（不含 meta 行，避免和 enriched 块重复）
+        base_body = "\n".join(body_paras).strip()
+
+        # 构建可选块
+        if self.enrich_format == "json":
+            meta_block = self._block_meta_json(meta)
+            bearers_block = self._block_bearers_json(bearers)
+        else:
+            meta_block = self._block_meta_readable(meta)
+            bearers_block = self._block_bearers_readable(bearers)
+
+        blocks = [b for b in (meta_block, bearers_block) if b]
+
+        if self.enrich_mode == "replace":
+            # 仅保留结构化块（无原始正文）
+            text_clean = RULER.join(blocks).strip() if blocks else base_body
+        elif self.enrich_mode == "append":
+            # 原始正文 + 结构化块
+            if base_body and blocks:
+                text_clean = (base_body + RULER + RULER.join(blocks)).strip()
+            elif blocks:
+                text_clean = RULER.join(blocks).strip()
+            else:
+                text_clean = base_body
+        else:
+            # none：保持你原来的行为（meta 行 + 正文）
+            meta_lines = [f"{k}：{v}" for k, v in meta.items()]
+            text_clean = "\n".join(meta_lines + ([""] if meta_lines and body_paras else []) + body_paras).strip()
 
         # item
         item = PageItem()
@@ -300,8 +415,8 @@ class FocusedSpider(scrapy.Spider):
         item["title"] = title
         item["pub_time"] = pub_time
         item["text"] = text_clean          # 纯文本（含换行）
-        item["text_lines"] = body_paras    # 段落数组（若你的管道会把 \n 改成 |，建议改存这个）
         item["html_path"] = str(html_path)
         item["meta"] = meta
         item["bearers"] = bearers
+        item["text_augmented"] = (self.enrich_mode in ("append", "replace"))  # NEW
         yield item
