@@ -1,0 +1,46 @@
+﻿<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+  <meta name="renderer" content="webkit">
+  <meta http-equiv="X-UA-Compatible" content="ie=edge,chrome=1">
+  <title>皮影数字博物馆 | Digital Museum of Shadow | Digital Museum of Chinese Shadow Puppetry</title>
+  <link rel="stylesheet" href="lib/css/normalize.css">
+  <link rel="stylesheet" href="lib/css/html5.css">
+  <link rel="stylesheet" href="src/index.css?v6.7">
+  
+  <!-- HTML5 shim 和 Respond.js 是为了让 IE8 支持 HTML5 元素和媒体查询（media queries）功能 -->
+  <!-- 警告：通过 file:// 协议（就是直接将 html 页面拖拽到浏览器中）访问页面时 Respond.js 不起作用 -->
+  <!--[if lt IE 9]>
+    <link rel="stylesheet" href="src/ie8.css?v0.5">
+    <script src="https://cdn.bootcss.com/html5shiv/r29/html5.min.js"></script>
+    <script src="https://cdn.bootcss.com/respond.js/1.4.2/respond.min.js"></script>
+    <script src="https://cdn.bootcss.com/es5-shim/4.5.12/es5-shim.min.js"></script>
+    <script src="https://cdn.bootcss.com/es5-shim/4.5.12/es5-sham.min.js"></script>
+  <![endif]-->
+
+  <script>
+    var ua = navigator.userAgent;
+    var agent = ["Android", "iPhone", "Windows Phone", "iPad"];
+    for(var i = 0; i< agent.length; i++){
+      if(ua.indexOf(agent[i])>0){
+        window.location.href = "https://shadow.caa.edu.cn/m/"
+        break;
+      }
+    }
+  </script>
+  <script>
+    var _hmt = _hmt || [];
+  </script>
+  <script src="lib/ckplayer/ckplayer.min.js"></script>
+  <script src="lib/require.min.js" data-main="src/main.js?v0.2"></script>
+</head>
+
+<body>
+  <div id="top" class="clearfix header"></div>
+  <div id="main"></div>
+</body>
+
+</html>

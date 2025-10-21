@@ -3,6 +3,7 @@
 """
 一键把“清晰版 JSONL”转换为：
   1) documents_min.jsonl（导入 documents 表）
+
   2) chunks.jsonl（导入 chunks 表）
 
 默认路径已按你的项目设置，如需修改，改下面 CONFIG 部分即可。

@@ -28,7 +28,7 @@ class FocusedSpider(scrapy.Spider):
         "ROBOTSTXT_OBEY": False,
         "LOG_LEVEL": "INFO",
         "ITEM_PIPELINES": {"crawler.pipelines.DedupeAndStorePipeline": 300},
-        "CLOSESPIDER_ITEMCOUNT": 1,
+        #"CLOSESPIDER_ITEMCOUNT": 1,
         "REQUEST_FINGERPRINTER_IMPLEMENTATION": "2.7",
         "FEED_EXPORT_ENCODING": "utf-8",
     }
@@ -194,8 +194,23 @@ class FocusedSpider(scrapy.Spider):
                     if para:
                         paras.append(para)
             else:
-                paras.extend(self._html_to_lines(c.get() or ""))
+                html = c.get() if hasattr(c, "get") else (c or "")
+                paras.extend(self._html_to_lines(html))
         return paras
+
+    def _is_404_like(self, response):
+        # URL 命中
+        if "/404.html" in response.url:
+            return True
+        # <title> 命中关键词
+        title = "".join(response.css("title::text").getall()).strip()
+        if re.search(r"\b404\b|未找到|不存在|页面走丢|Not\s*Found", title, re.I):
+            return True
+        # 正文里也兜底扫一眼（有些站 title 也写正常）
+        head = response.text[:2000]
+        if re.search(r"404|页面不存在|对不起|未找到|Not Found", head, re.I):
+            return True
+        return False
 
     # —— 项目基本信息表 —— #
     def _parse_meta_row_by_pairs(self, cells: list[str]) -> dict:
@@ -327,6 +342,9 @@ class FocusedSpider(scrapy.Spider):
             yield scrapy.Request(url, callback=self.parse_article, dont_filter=True)
 
     def parse_article(self, response):
+        if self._is_404_like(response):
+            self.logger.info("Skip 404-like page: %s", response.url)
+            return
         self.logger.info(f"[RESP] {response.status} {response.url}")
         if response.status != 200:
             return
